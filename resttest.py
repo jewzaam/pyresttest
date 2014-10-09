@@ -1,10 +1,12 @@
 import sys
 import os
+import math
 import operator
 import argparse
 import yaml
 import pycurl
 import json
+import csv
 import StringIO
 import logging
 
@@ -54,6 +56,7 @@ METRICS = {
 
     #Transfer sizes and speeds
     'size_download' : pycurl.SIZE_DOWNLOAD,
+    'size_upload' : pycurl.SIZE_UPLOAD,
     'request_size' : pycurl.REQUEST_SIZE,
     'speed_download' : pycurl.SPEED_DOWNLOAD,
     'speed_upload' : pycurl.SPEED_UPLOAD,
@@ -61,16 +64,16 @@ METRICS = {
     #Connection counts
     'redirect_count' : pycurl.REDIRECT_COUNT,
     'num_connects' : pycurl.NUM_CONNECTS
-
-    #TODO custom implementation for requests per second and server processing time, separate from previous?
 }
 
 #Map statistical aggregate to the function to use to perform the aggregation on an array
 AGGREGATES = {
     'mean_arithmetic': #AKA the average, good for many things
-        lambda x: float(sum(x))/len(x),
+        lambda x: float(sum(x))/float(len(x)),
+    'mean':  # Alias for arithmetic mean
+        lambda x: float(sum(x))/float(len(x)),
     'mean_harmonic': #Harmonic mean, better predicts average of rates: http://en.wikipedia.org/wiki/Harmonic_mean
-        lambda x: 1/( sum([1/float(y) for y in x]) / len(x)),
+        lambda x: 1.0/( sum([1.0/float(y) for y in x]) / float(len(x))),
     'median':  lambda x: median(x),
     'std_deviation': lambda x: std_deviation(x)
 }
@@ -78,12 +81,12 @@ AGGREGATES = {
 def median(array):
     """ Get the median of an array """
     sorted = [x for x in array]
-    sort(sorted)
-    floor = math.floor(len(sorted)/2) #Gets the middle element, if present
+    sorted.sort()
+    middle = len(sorted)/2 #Gets the middle element, if present
     if len(sorted) % 2 == 0: #Even, so need to average together the middle two values
-        return float((sorted[floor]+sorted[floor-1]))/2
+        return float((sorted[middle]+sorted[middle-1]))/2
     else:
-        return sorted[floor]
+        return sorted[middle]
 
 def std_deviation(array):
     """ Compute the standard deviation of an array of numbers """
@@ -93,7 +96,7 @@ def std_deviation(array):
     average = AGGREGATES['mean_arithmetic'](array)
     variance = map(lambda x: (x-average)**2,array)
     stdev = AGGREGATES['mean_arithmetic'](variance)
-    return setdev
+    return math.sqrt(stdev)
 
 class cd:
     """Context manager for changing the current working directory"""
@@ -131,8 +134,8 @@ class BodyReader:
         self.loc += (endidx-startidx)
         return result
 
-class Test:
-    """ Describes a REST test, which may include a benchmark component """
+class Test(object):
+    """ Describes a REST test """
     url  = None
     expected_status = [200]  # expected HTTP status code or codes
     body = None #Request body, if any (for POST/PUT methods)
@@ -141,9 +144,12 @@ class Test:
     group = u'Default'
     name = u'Unnamed'
     validators = None  # Validators for response body, IE regexes, etc
-    benchmark = None   # Benchmarking config for item
     stop_on_failure = False
     #In this case, config would be used by all tests following config definition, and in the same scope as tests
+
+    def __init__(self):
+        self.headers = dict()
+        self.expected_status = [200]
 
     def __str__(self):
         return json.dumps(self, default=lambda o: o.__dict__)
@@ -174,7 +180,7 @@ class Validator:
             raise Exception("Validation missing attribute 'operator': " + str(self))
 
         # from http://stackoverflow.com/questions/7320319/xpath-like-query-for-nested-python-dictionaries
-        self.actual = mydict 
+        self.actual = mydict
         try:
             logging.debug("Validator: pre query: " + str(self.actual))
             for x in self.query.strip(self.query_delimiter).split(self.query_delimiter):
@@ -193,7 +199,7 @@ class Validator:
 
         if self.operator == "exists":
             # require actual value
-            logging.debug("Validator: exists check") 
+            logging.debug("Validator: exists check")
             output = True if self.actual is not None else False
         elif self.operator == "empty":
             # expect no actual value
@@ -211,7 +217,7 @@ class Validator:
             output = True if self.actual == self.expected else False
         else:
             logging.debug("Validator: operator check: " + str(self.expected) + " " + str(self.operator) + " " + str(self.actual))
-            
+
             # any special case operators here:
             if self.operator == "contains":
                 if isinstance(self.actual, dict) or isinstance(self.actual, list):
@@ -249,37 +255,85 @@ class TestConfig:
 class TestSet:
     """ Encapsulates a set of tests and test configuration for them """
     tests = list()
+    benchmarks = list()
     config = TestConfig()
+
+    def __init__(self):
+        self.config = TestConfig()
+        self.tests = list()
+        self.benchmarks = list()
 
     def __str__(self):
         return json.dumps(self, default=lambda o: o.__dict__)
 
 class BenchmarkResult:
     """ Stores results from a benchmark for reporting use """
-    aggregates = dict() #Aggregation recult, maps metricname to dictionary of aggregate --> result
-    results = dict() #Benchmark output, map the metric to the result array for that metric
-    failures = 0 #Track call count that failed
+    group = None
+    name = u'unnamed'
+
+    results = dict()  # Benchmark output, map the metric to the result array for that metric
+    aggregates = list()  # List of aggregates, as tuples of (metricname, aggregate, result)
+    failures = 0  # Track call count that failed
+
+    def __init__(self):
+        self.aggregates = list()
+        self.results = list()
 
     def __str__(self):
         return json.dumps(self, default=lambda o: o.__dict__)
 
-class BenchmarkConfig:
-    """ Holds configuration specific to benchmarking of method
+class Benchmark(Test):
+    """ Extends test with configuration for benchmarking
         warmup_runs and benchmark_runs behave like you'd expect
 
         Metrics are a bit tricky:
-            - Key is metric name from Metric
+            - Key is metric name from METRICS
             - Value is either a single value or a list:
                 - list contains aggregagate name from AGGREGATES
                 - value of 'all' returns everything
     """
-    warmup_runs = 100 #Times call is executed to warm up
-    benchmark_runs = 1000 #Times call is executed to generate benchmark results
+    warmup_runs = 10 #Times call is executed to warm up
+    benchmark_runs = 100 #Times call is executed to generate benchmark results
+    output_format = u'csv'
+    output_file = None
 
-    #Metrics to gather, must have one of them!
-    metrics = dict()
+    #Metrics to gather, both raw and aggregated
+    metrics = set()
 
-    #TODO output of full response set to CSV / JSON
+    raw_metrics = set()  # Metrics that do not have any aggregation performed
+    aggregated_metrics = dict()  # Metrics where an aggregate is computed, maps key(metric name) -> list(aggregates to use)
+
+    def add_metric(self, metric_name, aggregate=None):
+        """ Add a metric-aggregate pair to the benchmark, where metric is a number to measure from curl, and aggregate is an aggregation function
+            (See METRICS and AGGREGATES)
+            If aggregate is not defined (False,empty, or None), then the raw number is reported
+            Returns self, for fluent-syle construction of config """
+
+        clean_metric = metric_name.lower().strip()
+
+        if clean_metric.lower() not in METRICS:
+            raise Exception("Metric named: " + metric_name + " is not a valid benchmark metric.")
+        self.metrics.add(clean_metric)
+
+        if not aggregate:
+            self.raw_metrics.add(clean_metric)
+        elif aggregate.lower().strip() in AGGREGATES:
+            # Add aggregate to this metric
+            clean_aggregate = aggregate.lower().strip()
+            current_aggregates = self.aggregated_metrics.get(clean_metric, list())
+            current_aggregates.append(clean_aggregate)
+            self.aggregated_metrics[clean_metric]  = current_aggregates
+        else:
+            raise Exception("Aggregate function " + aggregate + " is not a legal aggregate function name");
+
+        return self;
+
+
+    def __init__(self):
+        self.metrics = set()
+        self.raw_metrics = set()
+        self.aggregated_metrics = dict()
+        super(Benchmark, self).__init__()
 
     def __str__(self):
         return json.dumps(self, default=lambda o: o.__dict__)
@@ -291,7 +345,6 @@ class TestResponse:
     body = bytearray() #Response body, if tracked
     passed = False
     response_headers = bytearray()
-    statistics = None #Used for benchmark stats on the method
 
     def __str__(self):
         return json.dumps(self, default=lambda o: str(o) if isinstance(o, bytearray) else o.__dict__)
@@ -301,7 +354,7 @@ class TestResponse:
         self.body.extend(buf)
 
     def unicode_body(self):
-        return unicode(body,'UTF-8')
+        return unicode(self.body.decode('UTF-8'))
 
     def header_callback(self,buf):
         """ Write headers by pyCurl callback """
@@ -331,6 +384,7 @@ def build_testsets(base_url, test_structure, test_files = set() ):
     tests_out = list()
     test_config = TestConfig()
     testsets = list()
+    benchmarks = list()
     #returns a testconfig and collection of tests
     for node in test_structure: #Iterate through lists of test and configuration elements
         if isinstance(node,dict): #Each config element is a miniature key-value dictionary
@@ -345,21 +399,25 @@ def build_testsets(base_url, test_structure, test_files = set() ):
                         with cd(os.path.dirname(os.path.realpath(importfile))):
                             import_testsets = build_testsets(base_url, import_test_structure, test_files)
                             testsets.extend(import_testsets)
-                if key == u'url': #Simple test, just a GET to a URL
+                elif key == u'url': #Simple test, just a GET to a URL
                     mytest = Test()
                     val = node[key]
                     assert isinstance(val,str) or isinstance(val,unicode)
                     mytest.url = base_url + val
                     tests_out.append(mytest)
-                if key == u'test': #Complex test with additional parameters
+                elif key == u'test': #Complex test with additional parameters
                     child = node[key]
                     mytest = build_test(base_url, child)
                     tests_out.append(mytest)
-                if key == u'config' or key == u'configuration':
+                elif key == u'benchmark':
+                    benchmark = build_benchmark(base_url, node[key])
+                    benchmarks.append(benchmark)
+                elif key == u'config' or key == u'configuration':
                     test_config = make_configuration(node[key])
     testset = TestSet()
     testset.tests = tests_out
     testset.config = test_config
+    testset.benchmarks = benchmarks
     testsets.append(testset)
     return testsets
 
@@ -400,12 +458,12 @@ def flatten_dictionaries(input):
       Dictionary comprehensions can do this, but would like to allow for pre-Python 2.7 use
       If input isn't a list, just return it.... """
     output = dict()
-    if isinstance(input,list):
+    if isinstance(input, list):
         for map in input:
-            if not isinstance(map,dict):
+            if not isinstance(map, dict):
                 raise Exception('Tried to flatten a list of NON-dictionaries into a single dictionary. Whoops!')
             for key in map.keys(): #Add keys into output
-                    output[key]=map[key]
+                output[key]=map[key]
     else: #Not a list of dictionaries
         output = input;
     return output
@@ -428,14 +486,21 @@ def read_file(path): #TODO implementme, handling paths more intelligently
     f.close()
     return string
 
-def build_test(base_url, node):
-    """ Create a test using explicitly specified elements from the test input structure
+def build_test(base_url, node, input_test = None):
+    """ Create or modify a test, input_test, using configuration in node, and base_url
+     If no input_test is given, creates a new one
+
+     Uses explicitly specified elements from the test input structure
      to make life *extra* fun, we need to handle list <-- > dict transformations.
 
      This is to say: list(dict(),dict()) or dict(key,value) -->  dict() for some elements
 
      Accepted structure must be a single dictionary of key-value pairs for test configuration """
-    mytest = Test()
+
+    mytest = input_test
+    if not mytest:
+        mytest = Test()
+
     node = lowercase_keys(flatten_dictionaries(node)) #Clean up for easy parsing
 
     #Copy/convert input elements into appropriate form for a test object
@@ -475,9 +540,6 @@ def build_test(base_url, node):
                     mytest.validators.append(validator)
             else:
                 raise Exception('Misconfigured validator, requires type property')
-        elif configelement == u'benchmark':
-            raise NotImplementedError('Benchmark input parsing not supported yet') #TODO implement benchmarking parsing
-
         elif configelement == u'body': #Read request body, either as inline input or from file
             #Body is either {'file':'myFilePath'} or inline string with file contents
             if isinstance(configvalue, dict) and u'file' in lowercase_keys(configvalue):
@@ -520,8 +582,65 @@ def build_test(base_url, node):
 
     return mytest
 
+def build_benchmark(base_url, node):
+    """ Try building a benchmark configuration from deserialized configuration root node """
+    node = lowercase_keys(flatten_dictionaries(node))  # Make it usable
+
+    benchmark = Benchmark()
+
+    # Read & set basic test parameters
+    benchmark = build_test(base_url, node, benchmark)
+
+    # Complex parsing because of list/dictionary/singleton legal cases
+    for key, value in node.items():
+        if key == u'warmup_runs':
+            benchmark.warmup_runs = int(value)
+        elif key == u'benchmark_runs':
+            benchmark.benchmark_runs = int(value)
+        elif key == u'output_format':
+            format = value.lower()
+            if format in OUTPUT_FORMATS:
+                benchmark.output_format = format
+            else:
+                raise Exception('Invalid benchmark output format: ' + format)
+        elif key == u'output_file':
+            if not isinstance(value, basestring):
+                raise Exception("Invalid output file format")
+            benchmark.output_file = value
+        elif key == u'metrics':
+            if isinstance(value, unicode) or isinstance(value,str):
+                # Single value
+                benchmark.add_metric(unicode(value, 'UTF-8'))
+            elif isinstance(value, list) or isinstance(value, set):
+            # List of single values or list of {metric:aggregate, ...}
+                for metric in value:
+                    if isinstance(metric, dict):
+                        for metricname, aggregate in metric.items():
+                            if not isinstance(metricname, basestring):
+                                raise Exception("Invalid metric input: non-string metric name")
+                            if not isinstance(aggregate, basestring):
+                                raise Exception("Invalid aggregate input: non-string aggregate name")
+                            # TODO unicode-safe this
+                            benchmark.add_metric(unicode(metricname,'UTF-8'), unicode(aggregate,'UTF-8'))
+
+                    elif isinstance(metric, unicode) or isinstance(metric, str):
+                        benchmark.add_metric(unicode(metric,'UTF-8'))
+            elif isinstance(value, dict):
+                # Dictionary of metric-aggregate pairs
+                for metricname, aggregate in value.items():
+                    if not isinstance(metricname, basestring):
+                        raise Exception("Invalid metric input: non-string metric name")
+                    if not isinstance(aggregate, basestring):
+                        raise Exception("Invalid aggregate input: non-string aggregate name")
+                    benchmark.add_metric(unicode(metricname,'UTF-8'), unicode(aggregate,'UTF-8'))
+            else:
+                raise Exception("Invalid benchmark metric datatype: "+str(value))
+
+    return benchmark
+
 def configure_curl(mytest, test_config = TestConfig()):
     """ Create and mostly configure a curl object for test """
+
     if not isinstance(mytest, Test):
         raise Exception('Need to input a Test type object')
     if not isinstance(test_config, TestConfig):
@@ -571,7 +690,7 @@ def run_test(mytest, test_config = TestConfig()):
     # reset the body, it holds values from previous runs otherwise
     result.body = bytearray()
     curl.setopt(pycurl.WRITEFUNCTION, result.body_callback)
-    curl.setopt(pycurl.HEADERFUNCTION,result.header_callback) #Gets headers
+    curl.setopt(pycurl.HEADERFUNCTION, result.header_callback) #Gets headers
 
     if test_config.interactive:
         print "==================================="
@@ -592,6 +711,7 @@ def run_test(mytest, test_config = TestConfig()):
     response_code = curl.getinfo(pycurl.RESPONSE_CODE)
     result.response_code = response_code
     result.passed = response_code in mytest.expected_status
+    logging.debug("Initial Test Result, based on expected response code: "+str(result.passed))
 
     #print str(test_config.print_bodies) + ',' + str(not result.passed) + ' , ' + str(test_config.print_bodies or not result.passed)
 
@@ -626,12 +746,13 @@ def run_test(mytest, test_config = TestConfig()):
     curl.close()
     return result
 
-def benchmark(curl, benchmark_config):
+def run_benchmark(curl, benchmark, test_config = TestConfig()):
     """ Perform a benchmark, (re)using a given, configured CURL call to do so
-    This is surprisingly complex, because benchmark allows storing metric to aggregate """
+        The actual analysis of metrics is performed separately, to allow for testing
+    """
 
-    warmup_runs = benchmark_config.warmup_runs
-    benchmark_runs = benchmark_config.benchmark_runs
+    warmup_runs = benchmark.warmup_runs
+    benchmark_runs = benchmark.benchmark_runs
     message = ''  #Message is name of benchmark... print it?
 
     if (warmup_runs <= 0):
@@ -641,27 +762,33 @@ def benchmark(curl, benchmark_config):
 
     #Initialize variables to store output
     output = BenchmarkResult()
-    metricnames = list(benchmark_config.metrics.keys())
-    metricvalues = [METRICS[name] for name in metricnames] #Metric variable for curl, to avoid hash lookup for every metric name
-    results = [list() for x in xrange(0, len(metricnames))] #Initialize arrays to store results for each metric
+    output.name = benchmark.name
+    output.group = benchmark.group
+    metricnames = list(benchmark.metrics)
+    metricvalues = [METRICS[name] for name in metricnames]  # Metric variable for curl, to avoid hash lookup for every metric name
+    results = [list() for x in xrange(0, len(metricnames))]  # Initialize arrays to store results for each metric
 
     curl.setopt(pycurl.WRITEFUNCTION, lambda x: None) #Do not store actual response body at all.
 
     #Benchmark warm-up to allow for caching, JIT compiling, on client
     logging.info('Warmup: ' + message + ' started')
     for x in xrange(0, warmup_runs):
+        if benchmark.method == u'POST' or benchmark.method == u'PUT':
+            curl.setopt(curl.READFUNCTION, StringIO.StringIO(benchmark.body).read)
         curl.perform()
     logging.info('Warmup: ' + message + ' finished')
 
     logging.info('Benchmark: ' + message + ' starting')
 
-    for x in xrange(0, benchmark_runs): #Run the actual benchmarks
+    for x in xrange(0, benchmark_runs):  # Run the actual benchmarks
+        if benchmark.method == u'POST' or benchmark.method == u'PUT':
+            curl.setopt(curl.READFUNCTION, StringIO.StringIO(benchmark.body).read)
 
-        try: #Run the curl call, if it errors, then add to failure counts for benchmark
+        try:  # Run the curl call, if it errors, then add to failure counts for benchmark
             curl.perform()
         except Exception:
             output.failures = output.failures + 1
-            continue #Skip metrics collection
+            continue  # Skip metrics collection
 
         # Get all metrics values for this run, and store to metric lists
         for i in xrange(0, len(metricnames)):
@@ -669,33 +796,96 @@ def benchmark(curl, benchmark_config):
 
     logging.info('Benchmark: ' + message + ' ending')
 
+    temp_results = dict()
+    for i in xrange(0, len(metricnames)):
+        temp_results[metricnames[i]] = results[i]
+    output.results = temp_results
 
-    #Compute aggregates from results, and add to BenchmarkResult
-    # If it's storing all values (aggregate 'all'), it is added to BenchmarkResult.results arrays
-    # Otherwise, a dict {aggregate1:value1, aggregate2:value2...} is added to BenchmarkResult.aggregates[metricname]
-    for i in xrange(0,len(metricnames)):
-        metric = metricnames[i]
-        aggregates = benchmark_config.metrics[metric]
-        result_array = results[i]
+    curl.close()
+    return analyze_benchmark_results(output, benchmark)
 
-        #Convert aggregates to list, so we can iterate over them, even if single element
-        if not isinstance(aggregates,list) or isinstance(aggregates,set):
-            aggregates = [aggregates]
 
-        aggregate_results = dict()
+def analyze_benchmark_results(benchmark_result, benchmark):
+    """ Take a benchmark result containing raw benchmark results, and do aggregation by
+    applying functions """
 
-        #Compute values for all aggregates, apply aggregation function to the results array and store
-        for aggregate_name in aggregates:
-            aggregate_function = AGGREGATES[aggregate_name]
-            if aggregate_name == 'all': #Add to the results arrays storing full results
-                output.results[metric]=result_array
+    output = BenchmarkResult()
+    output.name = benchmark_result.name
+    output.group = benchmark_result.group
+    output.failures = benchmark_result.failures
+
+    # Copy raw metric arrays over where necessary
+    raw_results = benchmark_result.results
+    temp = dict()
+    for metric in benchmark.raw_metrics:
+        temp[metric] = raw_results[metric]
+    output.results = temp
+
+    # Compute aggregates for each metric, and add tuples to aggregate results
+    aggregate_results = list()
+    for metricname, aggregate_list in benchmark.aggregated_metrics.iteritems():
+        numbers = raw_results[metricname]
+        for aggregate_name in aggregate_list:
+            if numbers:  # Only compute aggregates if numbers exist
+                aggregate_function = AGGREGATES[aggregate_name]
+                aggregate_results.append( (metricname, aggregate_name, aggregate_function(numbers)) )
             else:
-                aggregate_results[aggregate_name] = aggregate_function(result_array)
+                aggregate_results.append( (metricname, aggregate_name, None) )
 
-        #Add aggregate-value mappings for this metric to output
-        output.aggregates[metric] = vals
-
+    output.aggregates = aggregate_results
     return output
+
+
+def metrics_to_tuples(raw_metrics):
+    """ Converts metric dictionary of name:values_array into list of tuples
+        Use case: writing out benchmark to CSV, etc
+
+        Input:
+        {'metric':[value1,value2...], 'metric2':[value1,value2,...]...}
+
+        Output: list, with tuple header row, then list of tuples of values
+        [('metric','metric',...), (metric1_value1,metric2_value1, ...) ... ]
+    """
+    if not isinstance(raw_metrics, dict):
+        raise TypeError("Input must be dictionary!")
+
+    metrics = sorted(raw_metrics.keys())
+    arrays = [raw_metrics[metric] for metric in metrics]
+
+    num_rows = len(arrays[0])  # Assume all same size or this fails
+    output = list()
+    output.append(tuple(metrics))  # Add headers
+
+    # Create list of tuples mimicking 2D array from input
+    for row in xrange(0, num_rows):
+        new_row = tuple([arrays[col][row] for col in xrange(0, len(arrays))])
+        output.append(new_row)
+    return output
+
+def write_benchmark_json(file_out, benchmark_result, benchmark, test_config = TestConfig()):
+    """ Writes benchmark to file as json"""
+    json.dump(benchmark_result, file_out)
+
+def write_benchmark_csv(file_out, benchmark_result, benchmark, test_config = TestConfig()):
+    """ Writes benchmark to file as csv """
+    writer = csv.writer(file_out)
+    writer.writerow(('Benchmark', benchmark_result.name))
+    writer.writerow(('Benchmark Group', benchmark_result.group))
+    writer.writerow(('Failures', benchmark_result.failures))
+
+    # Write result arrays
+    if benchmark_result.results:
+        writer.writerow(('Results',''))
+        writer.writerows(metrics_to_tuples(benchmark_result.results))
+    if benchmark_result.aggregates:
+        writer.writerow(('Aggregates',''))
+        writer.writerows(benchmark_result.aggregates)
+
+OUTPUT_FORMATS = [u'csv', u'json']
+
+# Method to call when writing benchmark file
+OUTPUT_METHODS = {u'csv' : write_benchmark_csv, u'json': write_benchmark_json}
+
 
 def execute_testsets(testsets):
     """ Execute a set of tests, using given TestSet list input """
@@ -707,9 +897,10 @@ def execute_testsets(testsets):
     for testset in testsets:
         mytests = testset.tests
         myconfig = testset.config
+        mybenchmarks = testset.benchmarks
 
         #Make sure we actually have tests to execute
-        if not mytests:
+        if not mytests and not mybenchmarks:
             # no tests in this test set, probably just imports.. skip to next test set
             break
 
@@ -749,6 +940,24 @@ def execute_testsets(testsets):
                 print 'STOP ON FAILURE! stopping test set execution, continuing with other test sets'
                 break
 
+        for benchmark in mybenchmarks:  # Run benchmarks, analyze, write
+            if not benchmark.metrics:
+                logging.debug('Skipping benchmark, no metrics to collect')
+                continue
+
+            logging.info("Benchmark Starting: "+benchmark.name+" Group: "+benchmark.group)
+            curl = configure_curl(benchmark, myconfig)
+            benchmark_result = run_benchmark(curl, benchmark, myconfig)
+            print benchmark_result
+            logging.info("Benchmark Done: "+benchmark.name+" Group: "+benchmark.group)
+
+            if benchmark.output_file:  # Write file
+                write_method = OUTPUT_METHODS[benchmark.output_format]
+                my_file =  open(benchmark.output_file, 'w')  # Overwrites file
+                logging.debug("Benchmark writing to file: " + benchmark.output_file)
+                write_method(my_file, benchmark_result, benchmark, test_config = myconfig)
+                my_file.close()
+
     if myinteractive:
         # a break for when interactive bits are complete, before summary data
         print "==================================="
@@ -763,7 +972,7 @@ def execute_testsets(testsets):
         else:
             print u'Test Group '+group+u' SUCCEEDED: '+ str((test_count-failures))+'/'+str(test_count) + u' Tests Passed!'
 
-    return total_failures 
+    return total_failures
 
 def main(args):
     """
@@ -778,7 +987,7 @@ def main(args):
     """
 
     if 'log' in args and args['log'] is not None:
-        logging.basicConfig(level=LOGGING_LEVELS.get(args['log'], logging.NOTSET))
+        logging.basicConfig(level=LOGGING_LEVELS.get(args['log'].lower(), logging.NOTSET))
 
     test_structure = read_test_file(args['test'])
     tests = build_testsets(args['url'], test_structure)
@@ -807,4 +1016,3 @@ if(__name__ == '__main__'):
     args = vars(parser.parse_args())
 
     main(args)
-
