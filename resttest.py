@@ -9,6 +9,9 @@ import json
 import csv
 import StringIO
 import logging
+from threading import Thread
+import threading
+import time
 
 LOGGING_LEVELS = {'debug': logging.DEBUG,
     'info': logging.INFO,
@@ -991,19 +994,33 @@ def main(args):
 
     test_structure = read_test_file(args['test'])
     tests = build_testsets(args['url'], test_structure)
+    threads = []
+    threadsNum = args['threads']
+    delay = 0
+    if threadsNum > 1:
+        delay = args['rampup'] / (threadsNum-1)
 
-    # Override configs from command line if config set
-    for t in tests:
-        if 'print_bodies' in args and args['print_bodies'] is not None:
-            t.config.print_bodies = safe_to_bool(args['print_bodies'])
+    for i in range(threadsNum):
+        # Override configs from command line if config set
+        for t in tests:
+            if 'print_bodies' in args and args['print_bodies'] is not None:
+                t.config.print_bodies = safe_to_bool(args['print_bodies'])
 
-        if 'interactive' in args and args['interactive'] is not None:
-            t.config.interactive = safe_to_bool(args['interactive'])
+            if 'interactive' in args and args['interactive'] is not None:
+                t.config.interactive = safe_to_bool(args['interactive'])
+        t = Thread(target=execute_testsets, args=(tests,)).start()
+        threads.append(t)
+        if delay > 0:
+            time.sleep(delay)
 
+    for t in threads:
+        if t is not None:
+            t.join()
+
+    #commented the lines below as they is not supported with threads yet
     # Execute all testsets
-    failures = execute_testsets(tests)
-
-    sys.exit(failures)
+    #failures = execute_testsets(tests)
+    #sys.exit(failures)
 
 #Allow import into another module without executing the main method
 if(__name__ == '__main__'):
@@ -1013,6 +1030,8 @@ if(__name__ == '__main__'):
     parser.add_argument(u"--print-bodies", help="Print all response bodies", type=bool)
     parser.add_argument(u"--log", help="Logging level")
     parser.add_argument(u"--interactive", help="Interactive mode")
+    parser.add_argument(u"--threads", help="Number of threads",type=int,default=1)
+    parser.add_argument(u"--rampup", help="Ramp-up period in seconds",type=int,default=0)
     args = vars(parser.parse_args())
 
     main(args)
