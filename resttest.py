@@ -251,6 +251,9 @@ class TestConfig:
     test_parallel = False  # Allow parallel execution of tests in a test set, for speed?
     validator_query_delimiter = "/"
     interactive = False
+    certificate_path = None
+    threading = False
+    verbose = None
 
     def __str__(self):
         return json.dumps(self, default=lambda o: o.__dict__)
@@ -453,6 +456,10 @@ def make_configuration(node):
             test_config.retries = int(value)
         elif key == u'validator_query_delimiter':
             test_config.validator_query_delimiter = str(value)
+        elif key == u'certificate_path':
+            test_config.certificate_path= str(value)
+        elif key == u'verbose':
+            test_config.verbose = True
 
     return test_config
 
@@ -650,7 +657,11 @@ def configure_curl(mytest, test_config = TestConfig()):
         raise Exception('Need to input a TestConfig type object for the testconfig')
 
     curl = pycurl.Curl()
-    # curl.setopt(pycurl.VERBOSE, 1)  # Debugging convenience
+    if test_config.verbose is not None:
+        curl.setopt(pycurl.VERBOSE, 1)  # Debugging convenience
+    if test_config.certificate_path is not None:
+        curl.setopt(pycurl.SSLCERT,test_config.certificate_path )
+        curl.setopt(pycurl.SSLKEY, test_config.certificate_path )
     curl.setopt(curl.URL, str(mytest.url))
     curl.setopt(curl.TIMEOUT, test_config.timeout)
 
@@ -692,6 +703,10 @@ def run_test(mytest, test_config = TestConfig()):
     result = TestResponse()
     # reset the body, it holds values from previous runs otherwise
     result.body = bytearray()
+
+    # If more than one thread, this NOSIGNAL must be configure so to curl can work properly
+    curl.setopt(pycurl.NOSIGNAL, 1)
+
     curl.setopt(pycurl.WRITEFUNCTION, result.body_callback)
     curl.setopt(pycurl.HEADERFUNCTION, result.header_callback) #Gets headers
 
@@ -917,10 +932,9 @@ def execute_testsets(testsets):
                 group_failure_counts[test.group] = 0
 
             result = run_test(test, test_config = myconfig)
-            result.body = None  # Remove the body, save some memory!
 
             if not result.passed: #Print failure, increase failure counts for that test group
-                logging.error('Test Failed: '+test.name+" URL="+test.url+" Group="+test.group+" HTTP Status Code: "+str(result.response_code))
+                logging.error('Test Failed: '+test.name+" URL="+test.url+" Group="+test.group+" HTTP Status Code: "+str(result.response_code)+" HTTP Message Body:"+str(result.body))
 
                 if test.validators is not None:
                     for validator in test.validators:
@@ -935,6 +949,7 @@ def execute_testsets(testsets):
             else: #Test passed, print results
                 logging.info('Test Succeeded: '+test.name+" URL="+test.url+" Group="+test.group)
 
+            result.body = None  # Remove the body, save some memory!
             #Add results for this test group to the resultset
             group_results[test.group].append(result)
 
@@ -1003,6 +1018,8 @@ def main(args):
     for i in range(threadsNum):
         # Override configs from command line if config set
         for t in tests:
+            if threadsNum > 1:
+                t.config.threading = True
             if 'print_bodies' in args and args['print_bodies'] is not None:
                 t.config.print_bodies = safe_to_bool(args['print_bodies'])
 
