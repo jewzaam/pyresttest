@@ -148,6 +148,7 @@ class Test(object):
     name = u'Unnamed'
     validators = None  # Validators for response body, IE regexes, etc
     stop_on_failure = False
+    sleepInSec = None # Put the thread to sleep after running this test
     #In this case, config would be used by all tests following config definition, and in the same scope as tests
 
     def __init__(self):
@@ -515,6 +516,7 @@ def build_test(base_url, node, input_test = None):
 
     #Copy/convert input elements into appropriate form for a test object
     for configelement, configvalue in node.items():
+        #print(configelement)
         #Configure test using configuration elements
         if configelement == u'url':
             assert isinstance(configvalue,str) or isinstance(configvalue,unicode) or isinstance(configvalue,int)
@@ -529,6 +531,9 @@ def build_test(base_url, node, input_test = None):
         elif configelement == u'name': #Test name
             assert isinstance(configvalue,str) or isinstance(configvalue,unicode) or isinstance(configvalue,int)
             mytest.name = unicode(configvalue,'UTF-8')
+        elif configelement == u'sleepinsec':
+            assert isinstance(configvalue,(int,float))
+            mytest.sleepInSec = float(configvalue)
         elif configelement == u'validators':
             #TODO implement more validators: regex, file/schema match, etc
             if isinstance(configvalue, list):
@@ -762,6 +767,8 @@ def run_test(mytest, test_config = TestConfig()):
     logging.debug(result)
 
     curl.close()
+    if mytest.sleepInSec is not None:
+        time.sleep(mytest.sleepInSec)
     return result
 
 def run_benchmark(curl, benchmark, test_config = TestConfig()):

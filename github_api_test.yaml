@@ -4,6 +4,7 @@
   - testset: "Simple github.com API Test"
 - test:
   - name: "Test with successful validations"
+  - sleepInSec: 2
   - url: "/search/users?q=jewzaam"
   - group: "Successful"
   - validators: # operator is applied as: <actual> <operator> <expected>
@@ -17,6 +18,7 @@
      - {query: "does_not_exist",  operator: "empty",  expected: ""} # have to put in expected or it fails..
 - test:
   - name: "Test with validations that will fail"
+  - sleepInSec: 5
   - url: "/search/users?q=someonethatdoesnotexist"
   - group: "Failure"
   - validators:
