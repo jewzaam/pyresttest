@@ -663,10 +663,14 @@ def configure_curl(mytest, test_config = TestConfig()):
 
     curl = pycurl.Curl()
     if test_config.verbose is not None:
-        curl.setopt(pycurl.VERBOSE, 1)  # Debugging convenience
+        curl.setopt(curl.VERBOSE, 1)  # Debugging convenience
     if test_config.certificate_path is not None:
-        curl.setopt(pycurl.SSLCERT,test_config.certificate_path )
-        curl.setopt(pycurl.SSLKEY, test_config.certificate_path )
+        curl.setopt(curl.SSLCERT,test_config.certificate_path )
+        curl.setopt(curl.SSLKEY, test_config.certificate_path )
+        curl.setopt(curl.CAINFO, test_config.certificate_path )
+        curl.setopt(curl.SSL_VERIFYHOST, 0)
+        curl.setopt(curl.SSL_VERIFYPEER, 0)
+        curl.setopt(curl.SSL_VERIFYPEER, False);
     curl.setopt(curl.URL, str(mytest.url))
     curl.setopt(curl.TIMEOUT, test_config.timeout)
 
