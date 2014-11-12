@@ -194,6 +194,7 @@ class Validator:
                     self.actual = self.actual[x]
                 except ValueError:
                     self.actual = self.actual.get(x)
+                logging.debug("Validator: after query: " + str(self.actual))
         except:
             logging.debug("Validator: exception applying query")
             pass
