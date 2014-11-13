@@ -9,7 +9,7 @@ import json
 import csv
 import StringIO
 import logging
-from threading import Thread
+from threading import Thread, current_thread
 import threading
 import time
 
@@ -374,7 +374,7 @@ def read_test_file(path):
     teststruct = yaml.safe_load(os.path.expandvars(read_file(path)))
     return teststruct
 
-def build_testsets(base_url, test_structure, test_files = set() ):
+def build_testsets(switch_benchmark, base_url, test_structure, test_files = set() ):
     """ Convert a Python datastructure read from validated YAML to a set of structured testsets
     The data stucture is assumed to be a list of dictionaries, each of which describes:
         - a tests (test structure)
@@ -405,7 +405,7 @@ def build_testsets(base_url, test_structure, test_files = set() ):
                         test_files.add(importfile)
                         import_test_structure = read_test_file(importfile)
                         with cd(os.path.dirname(os.path.realpath(importfile))):
-                            import_testsets = build_testsets(base_url, import_test_structure, test_files)
+                            import_testsets = build_testsets(switch_benchmark,base_url, import_test_structure, test_files)
                             testsets.extend(import_testsets)
                 elif key == u'url': #Simple test, just a GET to a URL
                     mytest = Test()
@@ -415,8 +415,12 @@ def build_testsets(base_url, test_structure, test_files = set() ):
                     tests_out.append(mytest)
                 elif key == u'test': #Complex test with additional parameters
                     child = node[key]
-                    mytest = build_test(base_url, child)
-                    tests_out.append(mytest)
+                    if switch_benchmark:
+                        benchmark = build_benchmark(base_url, node[key])
+                        benchmarks.append(benchmark)
+                    else:
+                        mytest = build_test(base_url, child)
+                        tests_out.append(mytest)
                 elif key == u'benchmark':
                     benchmark = build_benchmark(base_url, node[key])
                     benchmarks.append(benchmark)
@@ -646,9 +650,10 @@ def build_benchmark(base_url, node):
                 for metricname, aggregate in value.items():
                     if not isinstance(metricname, basestring):
                         raise Exception("Invalid metric input: non-string metric name")
-                    if not isinstance(aggregate, basestring):
-                        raise Exception("Invalid aggregate input: non-string aggregate name")
-                    benchmark.add_metric(unicode(metricname,'UTF-8'), unicode(aggregate,'UTF-8'))
+                    if isinstance(aggregate, basestring):
+                        benchmark.add_metric(unicode(metricname,'UTF-8'), unicode(aggregate,'UTF-8'))
+                    else:
+                        benchmark.add_metric(unicode(metricname,'UTF-8'))
             else:
                 raise Exception("Invalid benchmark metric datatype: "+str(value))
 
@@ -781,12 +786,15 @@ def run_benchmark(curl, benchmark, test_config = TestConfig()):
         The actual analysis of metrics is performed separately, to allow for testing
     """
 
+    # If more than one thread, this NOSIGNAL must be configure so to curl can work properly
+    curl.setopt(pycurl.NOSIGNAL, 1)
+
     warmup_runs = benchmark.warmup_runs
     benchmark_runs = benchmark.benchmark_runs
     message = ''  #Message is name of benchmark... print it?
 
-    if (warmup_runs <= 0):
-        raise Exception("Invalid number of warmup runs, must be > 0 :" + warmup_runs)
+    if (warmup_runs < 0):
+        raise Exception("Invalid number of warmup runs, must be >= 0 :" + warmup_runs)
     if (benchmark_runs <= 0):
         raise Exception("Invalid number of benchmark runs, must be > 0 :" + benchmark_runs)
 
@@ -816,6 +824,27 @@ def run_benchmark(curl, benchmark, test_config = TestConfig()):
 
         try:  # Run the curl call, if it errors, then add to failure counts for benchmark
             curl.perform()
+            result = TestResponse()
+            result.passed = curl.getinfo(pycurl.RESPONSE_CODE) in benchmark.expected_status
+            # execute validator on body
+            if result.passed == True:
+                if benchmark.validators is not None and isinstance(benchmark.validators, list):
+                    logging.debug("executing this many validators: " + str(len(benchmark.validators)))
+                    myjson = json.loads(str(result.body))
+                    for validator in benchmark.validators:
+                        # pass delimiter from config to validator
+                        validator.query_delimiter = test_config.validator_query_delimiter
+                        # execute validation
+                        mypassed = validator.validate(myjson)
+                        if mypassed == False:
+                            result.passed = False
+                            # do NOT break, collect all validation data!
+                        if test_config.interactive:
+                            # expected isn't really required, so accomidate with prepending space if it is set, else make it empty (for formatting)
+                            myexpected = " " + str(validator.expected) if validator.expected is not None else ""
+                            print "VALIDATOR: " + validator.query + " " + validator.operator + myexpected + " = " + str(validator.passed)
+                else:
+                    logging.debug("no validators found")
         except Exception:
             output.failures = output.failures + 1
             continue  # Skip metrics collection
@@ -832,6 +861,8 @@ def run_benchmark(curl, benchmark, test_config = TestConfig()):
     output.results = temp_results
 
     curl.close()
+    if benchmark.sleepInSec is not None:
+        time.sleep(benchmark.sleepInSec)
     return analyze_benchmark_results(output, benchmark)
 
 
@@ -983,7 +1014,16 @@ def execute_testsets(testsets):
 
             if benchmark.output_file:  # Write file
                 write_method = OUTPUT_METHODS[benchmark.output_format]
-                my_file =  open(benchmark.output_file, 'w')  # Overwrites file
+                benchmark.output_file = benchmark.output_file.replace("{thread}", current_thread().name); # Use this feature to avoid concurrency between files
+                benchmark.output_file = benchmark.output_file.replace("/", "'slash'"); # Remove slash
+
+                my_file = None
+                try:
+                    # Overwrites file
+                    my_file =  open(benchmark.output_file, 'w')
+                except IOError:
+                    # If not exists, create the file
+                    my_file = open(benchmark.output_file, 'a')
                 logging.debug("Benchmark writing to file: " + benchmark.output_file)
                 write_method(my_file, benchmark_result, benchmark, test_config = myconfig)
                 my_file.close()
@@ -1020,7 +1060,7 @@ def main(args):
         logging.basicConfig(level=LOGGING_LEVELS.get(args['log'].lower(), logging.NOTSET))
 
     test_structure = read_test_file(args['test'])
-    tests = build_testsets(args['url'], test_structure)
+    tests = build_testsets(args['switch_tests_to_benchmark'],args['url'], test_structure)
     threads = []
     threadsNum = args['threads']
     delay = 0
@@ -1061,6 +1101,7 @@ if(__name__ == '__main__'):
     parser.add_argument(u"--interactive", help="Interactive mode")
     parser.add_argument(u"--threads", help="Number of threads",type=int,default=1)
     parser.add_argument(u"--rampup", help="Ramp-up period in seconds",type=int,default=0)
+    parser.add_argument(u"--switch_tests_to_benchmark", help="Make tests behave as benchmarks so you don't have to re-configure it",type=bool,default=False)
     args = vars(parser.parse_args())
 
     main(args)
