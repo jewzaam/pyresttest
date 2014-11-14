@@ -217,7 +217,8 @@ class Validator:
         elif self.expected is None:
             raise Exception("Validation missing attribute 'expected': " + str(self))
         elif self.operator == "count":
-            self.actual = len(self.actual) # for a count, actual is the count of the collection
+            if not isinstance( self.actual, int ):
+                self.actual = len(self.actual) # for a count, actual is the count of the collection
             logging.debug("Validator: count check")
             output = True if self.actual == self.expected else False
         else:
@@ -661,7 +662,6 @@ def build_benchmark(base_url, node):
 
 def configure_curl(mytest, test_config = TestConfig()):
     """ Create and mostly configure a curl object for test """
-
     if not isinstance(mytest, Test):
         raise Exception('Need to input a Test type object')
     if not isinstance(test_config, TestConfig):
@@ -677,7 +677,8 @@ def configure_curl(mytest, test_config = TestConfig()):
         curl.setopt(curl.SSL_VERIFYHOST, 0)
         curl.setopt(curl.SSL_VERIFYPEER, 0)
         curl.setopt(curl.SSL_VERIFYPEER, False);
-    curl.setopt(curl.URL, str(mytest.url))
+    mytest.url=str(mytest.url).replace("{thread}", current_thread().name)
+    curl.setopt(curl.URL, mytest.url)
     curl.setopt(curl.TIMEOUT, test_config.timeout)
 
 
@@ -685,7 +686,7 @@ def configure_curl(mytest, test_config = TestConfig()):
 
     # HACK: process env vars again, since we have an extract capabilitiy in validation.. this is a complete hack, but I need functionality over beauty
     if mytest.body is not None:
-        mytest.body = os.path.expandvars(mytest.body)
+        mytest.body = os.path.expandvars(mytest.body).replace("{thread}", current_thread().name)
 
     # Set read function for post/put bodies
     if mytest.method == u'POST' or mytest.method == u'PUT':
@@ -718,6 +719,7 @@ def run_test(mytest, test_config = TestConfig()):
     result = TestResponse()
     # reset the body, it holds values from previous runs otherwise
     result.body = bytearray()
+    result.response_headers = bytearray()
 
     # If more than one thread, this NOSIGNAL must be configure so to curl can work properly
     curl.setopt(pycurl.NOSIGNAL, 1)
@@ -806,54 +808,79 @@ def run_benchmark(curl, benchmark, test_config = TestConfig()):
     metricvalues = [METRICS[name] for name in metricnames]  # Metric variable for curl, to avoid hash lookup for every metric name
     results = [list() for x in xrange(0, len(metricnames))]  # Initialize arrays to store results for each metric
 
-    curl.setopt(pycurl.WRITEFUNCTION, lambda x: None) #Do not store actual response body at all.
+    result = TestResponse()
+    result.body = bytearray()
+    result.response_headers = bytearray()
+    curl.setopt(pycurl.WRITEFUNCTION, result.body_callback)
+    curl.setopt(pycurl.HEADERFUNCTION, result.header_callback)
 
-    #Benchmark warm-up to allow for caching, JIT compiling, on client
-    logging.info('Warmup: ' + message + ' started')
+
+#Benchmark warm-up to allow for caching, JIT compiling, on client
+    logging.debug('Warmup: ' + message + ' started')
     for x in xrange(0, warmup_runs):
         if benchmark.method == u'POST' or benchmark.method == u'PUT':
             curl.setopt(curl.READFUNCTION, StringIO.StringIO(benchmark.body).read)
         curl.perform()
-    logging.info('Warmup: ' + message + ' finished')
+    logging.debug('Warmup: ' + message + ' finished')
 
-    logging.info('Benchmark: ' + message + ' starting')
+    logging.debug('Benchmark: ' + message + ' starting')
 
     for x in xrange(0, benchmark_runs):  # Run the actual benchmarks
         if benchmark.method == u'POST' or benchmark.method == u'PUT':
             curl.setopt(curl.READFUNCTION, StringIO.StringIO(benchmark.body).read)
 
-        try:  # Run the curl call, if it errors, then add to failure counts for benchmark
-            curl.perform()
-            result = TestResponse()
-            result.passed = curl.getinfo(pycurl.RESPONSE_CODE) in benchmark.expected_status
-            # execute validator on body
-            if result.passed == True:
-                if benchmark.validators is not None and isinstance(benchmark.validators, list):
-                    logging.debug("executing this many validators: " + str(len(benchmark.validators)))
-                    myjson = json.loads(str(result.body))
-                    for validator in benchmark.validators:
-                        # pass delimiter from config to validator
-                        validator.query_delimiter = test_config.validator_query_delimiter
-                        # execute validation
-                        mypassed = validator.validate(myjson)
-                        if mypassed == False:
-                            result.passed = False
-                            # do NOT break, collect all validation data!
-                        if test_config.interactive:
-                            # expected isn't really required, so accomidate with prepending space if it is set, else make it empty (for formatting)
-                            myexpected = " " + str(validator.expected) if validator.expected is not None else ""
-                            print "VALIDATOR: " + validator.query + " " + validator.operator + myexpected + " = " + str(validator.passed)
-                else:
-                    logging.debug("no validators found")
-        except Exception:
-            output.failures = output.failures + 1
-            continue  # Skip metrics collection
+ #       try:  # Run the curl call, if it errors, then add to failure counts for benchmark
+        curl.perform()
 
+        result.test = benchmark
+        response_code = curl.getinfo(pycurl.RESPONSE_CODE)
+        result.response_code = response_code
+        result.passed = response_code in benchmark.expected_status
+        logging.debug("Initial Test Result, based on expected response code: "+str(result.passed))
+
+        # execute validator on body
+        if result.passed == True:
+            if benchmark.validators is not None and isinstance(benchmark.validators, list):
+                logging.debug("executing this many validators: " + str(len(benchmark.validators)))
+                myjson = json.loads(str(result.body))
+                for validator in benchmark.validators:
+                    # pass delimiter from config to validator
+                    validator.query_delimiter = test_config.validator_query_delimiter
+                    # execute validation
+                    mypassed = validator.validate(myjson)
+                    if mypassed == False:
+                        result.passed = False
+                        output.failures = output.failures + 1
+
+                        logging.debug("VALIDATOR: not passed->"+
+                                      " Name="+benchmark.name+
+                                      " Group="+benchmark.group+
+                                      " HTTP Status Code="+str(result.response_code)+
+                                      " HTTP Message Body="+str(result.body)+
+                                      " Query="  + validator.query +
+                                      " Operator=" + validator.operator +
+                                      " Request URL="+benchmark.url+
+                                      " Request Body="+benchmark.body+
+                                      " Response Body="+str(result.body)+
+                                      " Response Header="+str(result.response_headers) )
+                        # do NOT break, collect all validation data!
+                    if test_config.interactive:
+                        # expected isn't really required, so accomidate with prepending space if it is set, else make it empty (for formatting)
+                        myexpected = " " + str(validator.expected) if validator.expected is not None else ""
+                        print "VALIDATOR: " + validator.query + " " + validator.operator + myexpected + " = " + str(validator.passed)
+            else:
+                logging.debug("no validators found")
+#        except Exception as detail:
+#            logging.info("Test fail: detail:\""+str(detail)+"\" result.body-> " + str(result.body)+ " result.header-> " + str(result.response_headers)  )
+#            output.failures = output.failures + 1
+#            continue  # Skip metrics collection
+        else:
+            logging.error('Test Failed: '+benchmark.name+" URL="+benchmark.url+" Group="+benchmark.group+" HTTP Status Code: "+str(result.response_code)+" HTTP Message Body:"+str(result.body))
         # Get all metrics values for this run, and store to metric lists
         for i in xrange(0, len(metricnames)):
             results[i].append( curl.getinfo(metricvalues[i]) )
 
-    logging.info('Benchmark: ' + message + ' ending')
+    logging.debug('Benchmark: ' + message + ' ending')
 
     temp_results = dict()
     for i in xrange(0, len(metricnames)):
@@ -973,7 +1000,8 @@ def execute_testsets(testsets):
             if test.group not in group_results:
                 group_results[test.group] = list()
                 group_failure_counts[test.group] = 0
-
+            if test.body is not None:
+                test.body.replace("{thread}", current_thread().name)
             result = run_test(test, test_config = myconfig)
 
             if not result.passed: #Print failure, increase failure counts for that test group
@@ -1009,7 +1037,7 @@ def execute_testsets(testsets):
             logging.info("Benchmark Starting: "+benchmark.name+" Group: "+benchmark.group)
             curl = configure_curl(benchmark, myconfig)
             benchmark_result = run_benchmark(curl, benchmark, myconfig)
-            print benchmark_result
+            #print benchmark_result
             logging.info("Benchmark Done: "+benchmark.name+" Group: "+benchmark.group)
 
             if benchmark.output_file:  # Write file
@@ -1055,9 +1083,10 @@ def main(args):
         log          - OPTIONAL - set logging level {debug,info,warning,error,critical} (default=warning)
         interactive  - OPTIONAL - mode that prints info before and after test exectuion and pauses for user input for each test
     """
-
     if 'log' in args and args['log'] is not None:
         logging.basicConfig(level=LOGGING_LEVELS.get(args['log'].lower(), logging.NOTSET))
+
+    logging.debug("Thread name: " + current_thread().name)
 
     test_structure = read_test_file(args['test'])
     tests = build_testsets(args['switch_tests_to_benchmark'],args['url'], test_structure)
