@@ -12,6 +12,7 @@ import logging
 from threading import Thread, current_thread
 import threading
 import time
+import copy
 
 LOGGING_LEVELS = {'debug': logging.DEBUG,
     'info': logging.INFO,
@@ -183,8 +184,8 @@ class Validator:
         if self.operator is None:
             raise Exception("Validation missing attribute 'operator': " + str(self))
 
+        self.actual = copy.deepcopy(mydict) # trying to solve the problem with actual which instance seems to change over time
         # from http://stackoverflow.com/questions/7320319/xpath-like-query-for-nested-python-dictionaries
-        self.actual = mydict
         try:
             logging.debug("Validator: pre query: " + str(self.actual))
             for x in self.query.strip(self.query_delimiter).split(self.query_delimiter):
@@ -204,11 +205,11 @@ class Validator:
 
         if self.operator == "exists":
             # require actual value
-            logging.debug("Validator: exists check")
+            logging.debug("Validator: exists check, actual is " + str(self.actual))
             output = True if self.actual is not None else False
         elif self.operator == "empty":
             # expect no actual value
-            logging.debug("Validator: empty check" )
+            logging.debug("Validator: empty check, actual is " + str(self.actual))
             output = True if self.actual is None else False
         elif self.actual is None:
             # all tests beyond here require actual to be set
@@ -217,23 +218,40 @@ class Validator:
         elif self.expected is None:
             raise Exception("Validation missing attribute 'expected': " + str(self))
         elif self.operator == "count":
+            logging.debug("Validator: actual was "+str(self.actual))
+
+            # trying to solve the problem with actual which instance seems to change over time
             if not isinstance( self.actual, int ):
                 self.actual = len(self.actual) # for a count, actual is the count of the collection
-            logging.debug("Validator: count check")
+            logging.debug("Validator: actual is "+str(self.actual) +" instance of "+ self.actual.__class__.__name__ +" and expected is "+str(self.expected)+" instance of "+ self.expected.__class__.__name__ )
+            logging.debug("Validator: actual is "+str(self.actual))
             output = True if self.actual == self.expected else False
+            logging.debug("Validator: count output" + str(output))
+            logging.debug("Validator: try output" + str(self.actual == 0))
+            logging.debug("Validator: try output" + str(self.expected == 0))
+            #logging.debug("Validator: actual is instance of "+ str(type(self.actual))+" and expected is instance of "+str(type(self.expected)))
+            #logging.debug("Validator: actual is instance of "+ str(id(type(self.actual)))+" and expected is instance of "+str(id(type(self.expected))))
+            a1 = str(self.actual)
+            a2 = int(a1)
+            a3 = a2 == 0
+            a4 =str(a3)
+            logging.debug("Validator: last comparison is"+a4)
         else:
-            logging.debug("Validator: operator check: " + str(self.expected) + " " + str(self.operator) + " " + str(self.actual))
+            varExpec =  self.expected
+            if isinstance(varExpec,str):
+                varExpec = self.expected.replace("{thread}", current_thread().name)
+            logging.debug("Validator: operator check: " + str(varExpec) + " " + str(self.operator) + " " + str(self.actual)+" and expected==actual?"+str(str(varExpec) == str(self.actual)))
 
             # any special case operators here:
             if self.operator == "contains":
                 if isinstance(self.actual, dict) or isinstance(self.actual, list):
-                    output = True if self.expected in self.actual else False
+                    output = True if varExpec in self.actual else False
                 else:
                     raise Exception("Attempted to use 'contains' operator on non-collection type: " + type(self.actual).__name__)
             else:
                 # operator list: https://docs.python.org/2/library/operator.html
                 myoperator = getattr(operator, self.operator)
-                output = True if myoperator(self.actual, self.expected) == True else False
+                output = True if myoperator(self.actual, varExpec) == True else False
 
         #print "Validator: output is " + str(output)
 
@@ -677,29 +695,31 @@ def configure_curl(mytest, test_config = TestConfig()):
         curl.setopt(curl.SSL_VERIFYHOST, 0)
         curl.setopt(curl.SSL_VERIFYPEER, 0)
         curl.setopt(curl.SSL_VERIFYPEER, False);
-    mytest.url=str(mytest.url).replace("{thread}", current_thread().name)
-    curl.setopt(curl.URL, mytest.url)
+    mytest.url=str(mytest.url)
+    curl.setopt(curl.URL, mytest.url.replace("{thread}", current_thread().name))
     curl.setopt(curl.TIMEOUT, test_config.timeout)
 
 
     #TODO use CURLOPT_READDATA http://pycurl.sourceforge.net/doc/files.html and lazy-read files if possible
 
+    tmpBody = None
     # HACK: process env vars again, since we have an extract capabilitiy in validation.. this is a complete hack, but I need functionality over beauty
     if mytest.body is not None:
-        mytest.body = os.path.expandvars(mytest.body).replace("{thread}", current_thread().name)
+        mytest.body = os.path.expandvars(mytest.body)
+        tmpBody = mytest.body.replace("{thread}", current_thread().name)
 
     # Set read function for post/put bodies
     if mytest.method == u'POST' or mytest.method == u'PUT':
-        curl.setopt(curl.READFUNCTION, StringIO.StringIO(mytest.body).read)
+        curl.setopt(curl.READFUNCTION, StringIO.StringIO(tmpBody).read)
 
     if mytest.method == u'POST':
         curl.setopt(HTTP_METHODS[u'POST'], 1)
         if mytest.body is not None:
-            curl.setopt(pycurl.POSTFIELDSIZE, len(mytest.body))  # Required for some servers
+            curl.setopt(pycurl.POSTFIELDSIZE, len(tmpBody))  # Required for some servers
     elif mytest.method == u'PUT':
         curl.setopt(HTTP_METHODS[u'PUT'], 1)
         if mytest.body is not None:
-            curl.setopt(pycurl.INFILESIZE, len(mytest.body))  # Required for some servers
+            curl.setopt(pycurl.INFILESIZE, len(tmpBody))  # Required for some servers
     elif mytest.method == u'DELETE':
         curl.setopt(curl.CUSTOMREQUEST,'DELETE')
 
@@ -766,9 +786,27 @@ def run_test(mytest, test_config = TestConfig()):
                 validator.query_delimiter = test_config.validator_query_delimiter
                 # execute validation
                 mypassed = validator.validate(myjson)
+
                 if mypassed == False:
                     result.passed = False
-                    # do NOT break, collect all validation data!
+
+                    logging.debug("VALIDATOR: not passed->"+
+                                  " Name="+str(mytest.name)+
+                                  " Group="+str(mytest.group)+
+                                  " HTTP Status Code="+str(result.response_code)+
+                                  " HTTP Message Body="+str(result.body)+
+                                  " Query="+ str(validator.query) +
+                                  " Operator="+str(validator.operator)+
+                                  " Thread="+str(current_thread().name)+
+                                  " Request URL="+str(mytest.url)+
+                                  " Request Body="+str(mytest.body)+
+                                  " Response Body="+str(result.body)+
+                                  " Response Header="+str(result.response_headers)+
+                                  " mytest.__dict__"+ str(mytest.__dict__)+
+                                  " test_config.__dict__"+ str(test_config.__dict__)+
+                                  " validator.__dict__"+ str(validator.__dict__))
+
+                # do NOT break, collect all validation data!
                 if test_config.interactive:
                     # expected isn't really required, so accomidate with prepending space if it is set, else make it empty (for formatting)
                     myexpected = " " + str(validator.expected) if validator.expected is not None else ""
@@ -816,21 +854,20 @@ def run_benchmark(curl, benchmark, test_config = TestConfig()):
 
 
 #Benchmark warm-up to allow for caching, JIT compiling, on client
-    logging.debug('Warmup: ' + message + ' started')
+
     for x in xrange(0, warmup_runs):
-        if benchmark.method == u'POST' or benchmark.method == u'PUT':
-            curl.setopt(curl.READFUNCTION, StringIO.StringIO(benchmark.body).read)
         curl.perform()
-    logging.debug('Warmup: ' + message + ' finished')
+
 
     logging.debug('Benchmark: ' + message + ' starting')
 
     for x in xrange(0, benchmark_runs):  # Run the actual benchmarks
-        if benchmark.method == u'POST' or benchmark.method == u'PUT':
-            curl.setopt(curl.READFUNCTION, StringIO.StringIO(benchmark.body).read)
 
- #       try:  # Run the curl call, if it errors, then add to failure counts for benchmark
-        curl.perform()
+        try:
+            curl.perform() #Run the actual call
+        except Exception as e:
+            print e
+            logging.critical("caught exception, traceback ="+ e, exc_info=True)
 
         result.test = benchmark
         response_code = curl.getinfo(pycurl.RESPONSE_CODE)
@@ -853,16 +890,20 @@ def run_benchmark(curl, benchmark, test_config = TestConfig()):
                         output.failures = output.failures + 1
 
                         logging.debug("VALIDATOR: not passed->"+
-                                      " Name="+benchmark.name+
-                                      " Group="+benchmark.group+
+                                      " Name="+str(benchmark.name)+
+                                      " Group="+str(benchmark.group)+
                                       " HTTP Status Code="+str(result.response_code)+
                                       " HTTP Message Body="+str(result.body)+
-                                      " Query="  + validator.query +
-                                      " Operator=" + validator.operator +
-                                      " Request URL="+benchmark.url+
-                                      " Request Body="+benchmark.body+
+                                      " Query="+ str(validator.query) +
+                                      " Operator="+str(validator.operator)+
+                                      " Thread="+str(current_thread().name)+
+                                      " Request URL="+str(benchmark.url)+
+                                      " Request Body="+str(benchmark.body)+
                                       " Response Body="+str(result.body)+
-                                      " Response Header="+str(result.response_headers) )
+                                      " Response Header="+str(result.response_headers)+
+                                      " benchmark.__dict__"+ str(benchmark.__dict__)+
+                                      " test_config.__dict__"+ str(test_config.__dict__)+
+                                      " validator.__dict__"+ str(validator.__dict__) )
                         # do NOT break, collect all validation data!
                     if test_config.interactive:
                         # expected isn't really required, so accomidate with prepending space if it is set, else make it empty (for formatting)
@@ -1000,8 +1041,6 @@ def execute_testsets(testsets):
             if test.group not in group_results:
                 group_results[test.group] = list()
                 group_failure_counts[test.group] = 0
-            if test.body is not None:
-                test.body.replace("{thread}", current_thread().name)
             result = run_test(test, test_config = myconfig)
 
             if not result.passed: #Print failure, increase failure counts for that test group
@@ -1042,16 +1081,16 @@ def execute_testsets(testsets):
 
             if benchmark.output_file:  # Write file
                 write_method = OUTPUT_METHODS[benchmark.output_format]
-                benchmark.output_file = benchmark.output_file.replace("{thread}", current_thread().name); # Use this feature to avoid concurrency between files
-                benchmark.output_file = benchmark.output_file.replace("/", "'slash'"); # Remove slash
+                tmpFile = benchmark.output_file.replace("{thread}", current_thread().name); # Use this feature to avoid concurrency between files
+                tmpFile = tmpFile.replace("/", "'slash'"); # Remove slash
 
                 my_file = None
                 try:
                     # Overwrites file
-                    my_file =  open(benchmark.output_file, 'w')
+                    my_file =  open(tmpFile, 'w')
                 except IOError:
                     # If not exists, create the file
-                    my_file = open(benchmark.output_file, 'a')
+                    my_file = open(tmpFile, 'a')
                 logging.debug("Benchmark writing to file: " + benchmark.output_file)
                 write_method(my_file, benchmark_result, benchmark, test_config = myconfig)
                 my_file.close()
@@ -1083,8 +1122,10 @@ def main(args):
         log          - OPTIONAL - set logging level {debug,info,warning,error,critical} (default=warning)
         interactive  - OPTIONAL - mode that prints info before and after test exectuion and pauses for user input for each test
     """
+    current_thread().name=args['thread_name']
+
     if 'log' in args and args['log'] is not None:
-        logging.basicConfig(level=LOGGING_LEVELS.get(args['log'].lower(), logging.NOTSET))
+        logging.basicConfig(level=LOGGING_LEVELS.get(args['log'].lower(), logging.NOTSET),format='%(asctime)s %(levelname)s %(threadName)-10s %(message)s',)
 
     logging.debug("Thread name: " + current_thread().name)
 
@@ -1096,24 +1137,27 @@ def main(args):
     if threadsNum > 1:
         delay = args['rampup'] / (threadsNum-1)
 
-    for i in range(threadsNum):
-        # Override configs from command line if config set
-        for t in tests:
-            if threadsNum > 1:
-                t.config.threading = True
-            if 'print_bodies' in args and args['print_bodies'] is not None:
-                t.config.print_bodies = safe_to_bool(args['print_bodies'])
+    if threadsNum == 1:
+        execute_testsets(tests)
+    else:
+        for i in range(threadsNum):
+            # Override configs from command line if config set
+            for t in tests:
+                if threadsNum > 1:
+                    t.config.threading = True
+                if 'print_bodies' in args and args['print_bodies'] is not None:
+                    t.config.print_bodies = safe_to_bool(args['print_bodies'])
 
-            if 'interactive' in args and args['interactive'] is not None:
-                t.config.interactive = safe_to_bool(args['interactive'])
-        t = Thread(target=execute_testsets, args=(tests,)).start()
-        threads.append(t)
-        if delay > 0:
-            time.sleep(delay)
+                if 'interactive' in args and args['interactive'] is not None:
+                    t.config.interactive = safe_to_bool(args['interactive'])
+            t = Thread(target=execute_testsets, args=(tests,)).start()
+            threads.append(t)
+            if delay > 0:
+                time.sleep(delay)
 
-    for t in threads:
-        if t is not None:
-            t.join()
+        for t in threads:
+            if t is not None:
+                t.join()
 
     #commented the lines below as they is not supported with threads yet
     # Execute all testsets
@@ -1131,6 +1175,7 @@ if(__name__ == '__main__'):
     parser.add_argument(u"--threads", help="Number of threads",type=int,default=1)
     parser.add_argument(u"--rampup", help="Ramp-up period in seconds",type=int,default=0)
     parser.add_argument(u"--switch_tests_to_benchmark", help="Make tests behave as benchmarks so you don't have to re-configure it",type=bool,default=False)
+    parser.add_argument(u"--thread_name", help="The name of the thread that can be used in the templates",type=str,default=current_thread().name)
     args = vars(parser.parse_args())
 
     main(args)
