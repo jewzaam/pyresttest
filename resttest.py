@@ -211,6 +211,8 @@ class Validator:
             # expect no actual value
             logging.debug("Validator: empty check, actual is " + str(self.actual))
             output = True if self.actual is None else False
+            if isinstance( self.actual, dict ) and not bool(self.actual):
+                output = True
         elif self.actual is None:
             # all tests beyond here require actual to be set
             logging.debug("Validator: actual is None")
