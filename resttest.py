@@ -694,8 +694,7 @@ def configure_curl(mytest, test_config = TestConfig()):
         curl.setopt(curl.SSLCERT,test_config.certificate_path )
         curl.setopt(curl.SSLKEY, test_config.certificate_path )
         curl.setopt(curl.CAINFO, test_config.certificate_path )
-        curl.setopt(curl.SSL_VERIFYHOST, 0)
-        curl.setopt(curl.SSL_VERIFYPEER, 0)
+        curl.setopt(curl.SSL_VERIFYHOST, False)
         curl.setopt(curl.SSL_VERIFYPEER, False);
     mytest.url=str(mytest.url)
     curl.setopt(curl.URL, mytest.url.replace("{thread}", current_thread().name))
